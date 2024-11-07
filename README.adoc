@@ -1,1 +1,3 @@
 = NXsym-tests
+
+Test data is at https://anl.app.box.com/s/waqffd2sg5aospk1o6tik7rfibew0zmm
