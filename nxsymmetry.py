@@ -6,17 +6,52 @@
 # The full license is in the file LICENSE.pdf, distributed with this software.
 # -----------------------------------------------------------------------------
 
-# Original version at: https://anl.app.box.com/s/waqffd2sg5aospk1o6tik7rfibew0zmm
+# Original version at:
+# https://anl.app.box.com/s/waqffd2sg5aospk1o6tik7rfibew0zmm
+
+"""
+NX SYMMETRY
+"""
 
 import os
 import sys
 import tempfile
+import time
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import get_context, resource_tracker
 
 import numpy as np
 from nexusformat.nexus import nxopen, nxgetconfig, nxsetconfig, NXentry, NXdata
+
+
+def parse_args():
+    import argparse
+    parser = argparse.ArgumentParser(description="")
+    parser.add_argument("transform_file", help="Input")
+    parser.add_argument("symm_file", help="Output")
+    parser.add_argument("-n", type=int, default=2,
+                        help="Parallelism")
+    args = parser.parse_args()
+    return args
+
+
+def main():
+    args = parse_args()
+    with nxopen(args.transform_file, 'r') as transform_root:
+        data = transform_root['entry/data/v']
+
+    with nxopen(args.symm_file, 'w') as symm_root:
+        symm_root['entry'] = NXentry()
+        symm_root['entry/data'] = NXdata()
+        symmetry = NXSymmetry(data, laue_group='m-3m')
+        symm_root['entry/data/data'] = \
+            symmetry.symmetrize(parallelism=args.n)
+
+
+def report(label, start, stop):
+    label += ":"
+    print("%-14s %8.3f" % (label, stop - start))
 
 
 def triclinic(data):
@@ -72,14 +107,50 @@ def hexagonal(data):
 
 def cubic(data):
     """Laue group: m-3 or m-3m"""
+    print("cubic start")
+    sys.stdout.flush()
+
+    cubic_start = time.time()
+
+    start = time.time()
     outarr = np.nan_to_num(data)
+    stop = time.time()
+    report("nan_to_num", start, stop)
+
+    start = time.time()
     outarr += np.transpose(outarr, axes=(1, 2, 0))
+    stop = time.time()
+    report("transpose1", start, stop)
+
+    start = time.time()
     outarr += np.transpose(outarr, axes=(2, 0, 1))
+    stop = time.time()
+    report("transpose2", start, stop)
+
+    start = time.time()
     outarr += np.transpose(outarr, axes=(0, 2, 1))
+    stop = time.time()
+    report("transpose3", start, stop)
+
+    start = time.time()
     outarr += np.flip(outarr, 0)
+    stop = time.time()
+    report("flip1", start, stop)
+
+    start = time.time()
     outarr += np.flip(outarr, 1)
+    stop = time.time()
+    report("flip2", start, stop)
+
+    start = time.time()
     outarr += np.flip(outarr, 2)
+    stop = time.time()
+    report("flip3", start, stop)
+
+    stop = time.time()
+    report("cubic time", cubic_start, stop)
     return outarr
+
 
 def symmetrize_entries(symm_function, data_type, data_file, data_path):
     """
@@ -152,6 +223,7 @@ def symmetrize_data(symm_function, data_type, data_file, data_path):
     filename : str
         The name of the file containing the symmetrized data.
     """
+    start = time.time()
     nxsetconfig(lock=3600, lockexpiry=28800)
     with nxopen(data_file, 'r') as data_root:
         data_size = int(data_root[data_path].nbytes / 1e6) + 1000
@@ -162,9 +234,22 @@ def symmetrize_data(symm_function, data_type, data_file, data_path):
             signal = data_root[data_path].nxvalue
             data = np.zeros(signal.shape, signal.dtype)
             data[np.where(signal > 0)] = 1
+    stop = time.time()
+    report("startup", start, stop)
+
+    start = time.time()
     result = symm_function(data)
-    with nxopen(tempfile.mkstemp(suffix='.nxs')[1], mode='w') as root:
+    stop = time.time()
+    report("compute", start, stop)
+
+    start = time.time()
+    nx_tmp = tempfile.mkstemp(suffix='.nxs')[1]
+    print("nx_tmp: '%s'" % nx_tmp)
+    with nxopen(nx_tmp, mode='w') as root:
         root['data'] = result
+    stop = time.time()
+    report("write", start, stop)
+
     return data_type, root.nxfilename
 
 
@@ -203,13 +288,15 @@ class NXSymmetry:
             The path to the data in the file.
         """
         if laue_group and laue_group in laue_functions:
+            print("using laue function: " + laue_group)
             self.symm_function = laue_functions[laue_group]
         else:
+            print("using default laue function triclinic")
             self.symm_function = triclinic
         self.data_file = data.nxfilename
         self.data_path = data.nxpath
 
-    def symmetrize(self, entries=False):
+    def symmetrize(self, entries=False, parallelism=2):
         """
         Symmetrize the data.
 
@@ -224,16 +311,19 @@ class NXSymmetry:
         array-like
             The symmetrized data.
         """
+        print("symmetrize: entries=" + str(entries))
         if entries:
             symmetrize = symmetrize_entries
         else:
             symmetrize = symmetrize_data
-        with NXExecutor(max_workers=2) as executor:
+        with NXExecutor(max_workers=parallelism) as executor:
             futures = []
             for data_type in ['signal', 'weights']:
                 futures.append(executor.submit(
                     symmetrize, self.symm_function, data_type,
                     self.data_file, self.data_path))
+        weights = None
+        signal = None
         for future in as_completed(futures):
             data_type, result_file = future.result()
             with nxopen(result_file, 'r') as result_root:
@@ -254,6 +344,7 @@ class NXExecutor(ProcessPoolExecutor):
     """ProcessPoolExecutor class using 'spawn' for new processes."""
 
     def __init__(self, max_workers=None, mp_context='spawn'):
+        # print("NXExecutor: %i workers" % max_workers)
         if mp_context:
             mp_context = get_context(mp_context)
         else:
@@ -271,15 +362,4 @@ class NXExecutor(ProcessPoolExecutor):
 
 
 if __name__ == '__main__':
-
-    transform_file = sys.argv[1]
-    symm_file = sys.argv[2]
-
-    with nxopen(transform_file, 'r') as transform_root:
-        data = transform_root['entry/data/v']
-
-    with nxopen(symm_file, 'w') as symm_root:
-        symm_root['entry'] = NXentry()
-        symm_root['entry/data'] = NXdata()
-        symmetry = NXSymmetry(data, laue_group='m-3m')
-        symm_root['entry/data/data'] = symmetry.symmetrize()
+    main()
