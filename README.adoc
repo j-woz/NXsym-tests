@@ -1,1 +1,1 @@
-# NXsym-tests
+= NXsym-tests
